@@ -1,31 +1,41 @@
 from flask import Flask, request
-import requests
-import os
+import os, requests
 
 app = Flask(__name__)
+
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-@app.route('/')
-def home():
+@app.route('/', methods=['GET'])
+def index():
     return "DzDayBot alive"
 
 @app.route('/webhook', methods=['POST'])
-def webhook():
-    data = request.get_json()
-    if "message" in data:
-        chat_id = data["message"]["chat"]["id"]
-        text = data["message"].get("text", "")
+def tg_webhook():
+    update = request.get_json()
+
+    # debug: in log để biết Telegram có gọi vào không
+    print("UPDATE >>>", update, flush=True)
+
+    if "message" in update:
+        chat_id = update["message"]["chat"]["id"]
+        text = update["message"].get("text", "")
+
         if text == "/start":
-            send(chat_id, "Xin chào, tôi là DzDay – trợ lý Dandattone của ông đây 😏")
+            send_msg(chat_id, "Xin chào, tôi là DzDay – đang chạy trên Railway 😏")
         elif text == "/today":
-            send(chat_id, "Hôm nay là Ngày Bánh Crepe Toàn Cầu 🍰 – lý do tuyệt vời để nấu ngu.")
+            send_msg(chat_id, "Hôm nay là Ngày Bánh Crepe Toàn Cầu 🍰 – lý do tuyệt vời để nấu ngu.")
         else:
-            send(chat_id, f"Tôi nghe không rõ lắm: {text}")
+            send_msg(chat_id, f"Tôi nghe không rõ lắm: {text}")
+
     return {"ok": True}
 
-def send(chat_id, text):
-    requests.post(f"{API_URL}/sendMessage", json={"chat_id": chat_id, "text": text})
+def send_msg(chat_id, text):
+    r = requests.post(f"{API_URL}/sendMessage", json={
+        "chat_id": chat_id,
+        "text": text
+    })
+    print("SEND >>>", r.text, flush=True)
 
-if __name__ == '__main__':
-    app.run(debug=True)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))

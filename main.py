@@ -1,10 +1,11 @@
 from flask import Flask, request
-import os, requests
+import os, requests, threading, time
 
 app = Flask(__name__)
 
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+SELF_URL = os.getenv("SELF_URL")  # https://dzday.up.railway.app/
 
 @app.route("/", methods=["GET"])
 def index():
@@ -29,26 +30,26 @@ def webhook():
     return {"ok": True}
 
 def send_msg(chat_id, text):
+    if not BOT_TOKEN:
+        print("NO TOKEN!!", flush=True)
+        return
     resp = requests.post(f"{API_URL}/sendMessage", json={
         "chat_id": chat_id,
         "text": text
     })
     print("SEND >>>", resp.text, flush=True)
 
-# KHÔNG cần app.run() vì đã có gunicorn chạy từ Procfile
-import threading, time, requests as req2, os
-
 def keep_warm():
-    url = os.getenv("SELF_URL")
-    if not url:
+    if not SELF_URL:
         return
     while True:
         try:
-            req2.get(url, timeout=5)
-        except Exception:
-            pass
-        time.sleep(25)
+            # gọi vào / để container thấy có traffic
+            requests.get(SELF_URL, timeout=5)
+            print("WARM >>> ping", flush=True)
+        except Exception as e:
+            print("WARM ERR >>>", e, flush=True)
+        time.sleep(25)   # 25s/lần là đủ giữ sống
 
-if os.getenv("SELF_URL"):
-    threading.Thread(target=keep_warm, daemon=True).start()
-
+# chạy thread giữ ấm
+threading.Thread(target=keep_warm, daemon=True).start()

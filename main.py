@@ -6,18 +6,16 @@ app = Flask(__name__)
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-@app.route('/', methods=['GET'])
+@app.route("/", methods=["GET"])
 def index():
     return "DzDayBot alive"
 
-@app.route('/webhook', methods=['POST'])
-def tg_webhook():
+@app.route("/webhook", methods=["POST"])
+def webhook():
     update = request.get_json()
-
-    # debug: in log để biết Telegram có gọi vào không
     print("UPDATE >>>", update, flush=True)
 
-    if "message" in update:
+    if update and "message" in update:
         chat_id = update["message"]["chat"]["id"]
         text = update["message"].get("text", "")
 
@@ -31,11 +29,10 @@ def tg_webhook():
     return {"ok": True}
 
 def send_msg(chat_id, text):
-    r = requests.post(f"{API_URL}/sendMessage", json={
+    resp = requests.post(f"{API_URL}/sendMessage", json={
         "chat_id": chat_id,
         "text": text
     })
-    print("SEND >>>", r.text, flush=True)
+    print("SEND >>>", resp.text, flush=True)
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+# KHÔNG cần app.run() vì đã có gunicorn chạy từ Procfile

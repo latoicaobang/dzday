@@ -36,3 +36,19 @@ def send_msg(chat_id, text):
     print("SEND >>>", resp.text, flush=True)
 
 # KHÔNG cần app.run() vì đã có gunicorn chạy từ Procfile
+import threading, time, requests as req2, os
+
+def keep_warm():
+    url = os.getenv("SELF_URL")
+    if not url:
+        return
+    while True:
+        try:
+            req2.get(url, timeout=5)
+        except Exception:
+            pass
+        time.sleep(25)
+
+if os.getenv("SELF_URL"):
+    threading.Thread(target=keep_warm, daemon=True).start()
+

@@ -84,10 +84,11 @@ def make_log(update, command, text):
 
 def log_event(payload):
     if not LOG_URL:
+        print("LOG >>> skipped (no LOG_URL)", flush=True)
         return
     try:
-        requests.post(LOG_URL, json=payload, timeout=5)
-        print("LOG >>> ok", flush=True)
+        r = requests.post(LOG_URL, json=payload, timeout=5)
+        print("LOG >>>", r.status_code, r.text[:200], flush=True)
     except Exception as e:
         print("LOG ERR >>>", e, flush=True)
 

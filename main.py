@@ -56,7 +56,7 @@ def webhook():
             "🎂 *Hôm nay là Ngày bánh Crepe Toàn cầu*\n\n"
             "Nghe hơi giống bánh xèo miền Tây, nhưng đúng là người ta bày ra để có cớ trộn bột rồi đổ mỏng cho sang. "
             "Thông minh như bạn thì sẽ chém *tôi ăn vì văn hoá*, nghe uy tín hơn là ăn vì đói.\n\n"
-            "Xin chúc mừng: bạn đã biết thêm 1 loại bánh tuy mỏng nhưng ăn nhiều vẫn mập thù lù.\n"
+            "Xin chúc mừng: bạn đã biết thêm 1 loại bánh tuy mỏng nhưng ăn nhiều vẫn mập thù lù.\n\n"
             "#viaDzDay https://dz.day/today"
         )
         return send_msg(chat_id, body, parse_mode="Markdown")

@@ -1,145 +1,79 @@
 from flask import Flask, request
-import os
-import requests
-import time
-import threading
-import random
-import string
-from datetime import datetime, timedelta, timezone
+import os, requests, time, threading, io, random, string
+from datetime import datetime
+from PIL import Image, ImageDraw, ImageFont
+import qrcode
 
 app = Flask(__name__)
 
-# ====== ENV ======
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
+SELF_URL = os.getenv("SELF_URL")
+LOG_URL = os.getenv("LOG_URL")
 
-SELF_URL = os.getenv("SELF_URL")  # ví dụ: https://dzday-production.up.railway.app/
-LOG_URL = os.getenv("LOG_URL")    # Apps Script deploy URL
-MAX_UPDATE_AGE = 90               # giây
+MAX_UPDATE_AGE = 90  # seconds
+DAILY_LIMIT = {}  # in-memory limit
 
-# ====== LIMIT IN-MEM ======
-# cấu trúc: { "2025-11-03": { 70184xxxx: 3 } }
-DAILY_EXPORT = {}
-MAX_EXPORT_PER_DAY = 10
+# === Helpers ===
+def generate_nonce():
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
 
-
-# -------------------------------------------------
-# helpers chung
-# -------------------------------------------------
-def vn_today_str():
-    return (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%d")
-
-
-def generate_nonce(length=8):
-    chars = string.ascii_lowercase + string.digits
-    return "".join(random.choice(chars) for _ in range(length))
-
-
-def extract_user(update: dict):
-    if "message" in update:
-        return update["message"].get("from", {})
-    if "callback_query" in update:
-        return update["callback_query"].get("from", {})
-    return {}
-
-
-def extract_chat(update: dict):
-    if "message" in update:
-        return update["message"].get("chat", {})
-    if "callback_query" in update:
-        return update["callback_query"].get("message", {}).get("chat", {})
-    return {}
-
+def check_daily_limit(chat_id):
+    now = datetime.utcnow().strftime("%Y-%m-%d")
+    key = f"{chat_id}_{now}"
+    DAILY_LIMIT.setdefault(key, 0)
+    DAILY_LIMIT[key] += 1
+    return DAILY_LIMIT[key] <= 10
 
 def build_caption(preset, day_name, fun_fact, nonce):
-    shortlink = f"https://dz.day/today?nonce={nonce}&utm_source=telegram&utm_medium=share_button"
+    link = f"https://dz.day/today?nonce={nonce}&utm_source=telegram&utm_medium=share_button"
     if preset == "tau_hai":
-        return (
-            f"🎂 {day_name}\n"
-            f"Hôm nay nhân loại lại rảnh.\n"
-            f"Fun fact: {fun_fact}\n"
-            f"#viaDzDay {shortlink}"
-        )
-    if preset == "trung_tinh":
-        return (
-            f"🎂 {day_name}\n"
-            f"{fun_fact}\n"
-            f"#viaDzDay {shortlink}"
-        )
-    # default: mỉa nhẹ
-    return (
-        f"🎂 {day_name}\n"
-        f"Không ai bắt ông tin, nhưng người ta bày ra để có cớ trộn bột rồi đổ mỏng cho sang.\n"
-        f"Fun fact: {fun_fact}\n"
-        f"#viaDzDay {shortlink}"
-    )
+        return f"🤣 Hôm nay là {day_name}!\nLý do? Vì nhân loại rảnh quá thôi.\nFun fact: {fun_fact}\n#viaDzDay {link}"
+    elif preset == "trung_tinh":
+        return f"📅 {day_name}\nFun fact: {fun_fact}\n#viaDzDay {link}"
+    else:
+        return f"🎂 Hôm nay là {day_name}\nKhông ai bắt ông tin, nhưng người ta bịa ra đấy.\nFun fact: {fun_fact}\n#viaDzDay {link}"
 
+# === Card Generator ===
+def generate_card(day_name, fun_fact, nonce):
+    W, H = 1080, 1350
+    bg = Image.new("RGB", (W, H), color=(245, 240, 230))
+    draw = ImageDraw.Draw(bg)
 
-def check_daily_limit(chat_id: int):
-    today = vn_today_str()
-    if today not in DAILY_EXPORT:
-        DAILY_EXPORT[today] = {}
-    user_map = DAILY_EXPORT[today]
-    cur = user_map.get(chat_id, 0)
-    if cur >= MAX_EXPORT_PER_DAY:
-        return False
-    user_map[chat_id] = cur + 1
-    return True
+    # Fonts
+    title_font = ImageFont.truetype("arial.ttf", 64)
+    body_font = ImageFont.truetype("arial.ttf", 38)
+    small_font = ImageFont.truetype("arial.ttf", 30)
 
+    # Text layout
+    y = 160
+    draw.text((80, y), f"🎂 {day_name}", font=title_font, fill=(30, 30, 30))
+    y += 140
+    draw.text((80, y), "Không ai bắt ông tin, nhưng người ta bày ra để có cớ trộn bột rồi đổ mỏng cho sang.", font=body_font, fill=(60, 60, 60))
+    y += 220
+    draw.text((80, y), f"Fun fact: {fun_fact}", font=body_font, fill=(70, 70, 70))
 
-def log_event(payload: dict):
-    if not LOG_URL:
-        print("LOG >>> skipped (no LOG_URL)", flush=True)
-        return
-    try:
-        r = requests.post(LOG_URL, json=payload, timeout=5)
-        print("LOG >>>", r.status_code, r.text[:200], flush=True)
-    except Exception as e:
-        print("LOG ERR >>>", e, flush=True)
+    # QR section
+    link = f"https://dz.day/today?nonce={nonce}&utm_source=telegram&utm_medium=qr"
+    qr = qrcode.QRCode(version=1, box_size=6, border=2)
+    qr.add_data(link)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="black", back_color="white").resize((220, 220))
+    bg.paste(qr_img, (W - 260, H - 280))
 
+    # Watermark
+    draw.text((80, H - 160), "#viaDzDay", font=small_font, fill=(100, 100, 100))
+    draw.text((80, H - 100), "dz.day/today", font=small_font, fill=(120, 120, 120))
 
-def make_log(update: dict, command: str, text: str, extra: dict = None):
-    user = extract_user(update)
-    chat = extract_chat(update)
-    base = {
-        "chat_id": chat.get("id"),
-        "username": user.get("username") or user.get("first_name") or "",
-        "text": text,
-        "command": command,
-        "raw": update,
-        "source": "telegram",
-        "timestamp": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
-        # 3 cột mới – để script ghi luôn
-        "nonce": "",
-        "action": "",
-        "caption_preset": "",
-    }
-    if extra:
-        base.update(extra)
-    return base
+    bio = io.BytesIO()
+    bg.save(bio, format="JPEG", quality=90)
+    bio.seek(0)
+    return bio
 
-
-def tg_send(chat_id, text, reply_markup=None):
-    if not API_URL:
-        print("NO TOKEN >>>", flush=True)
-        return
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    r = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=10)
-    print("SEND >>>", r.text[:200], flush=True)
-
-
-# -------------------------------------------------
-# Flask routes
-# -------------------------------------------------
+# === Telegram Bot ===
 @app.route("/", methods=["GET"])
 def index():
     return "DzDayBot alive"
-
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -148,142 +82,121 @@ def webhook():
     if not update:
         return {"ok": True}
 
-    # 1) callback trước
-    if "callback_query" in update:
-        return handle_callback(update)
+    # handle message
+    if "message" in update:
+        msg = update["message"]
+        chat_id = msg["chat"]["id"]
+        text = (msg.get("text") or "").strip()
+        msg_ts = msg.get("date")
 
-    # 2) message thường
-    msg = update.get("message") or {}
-    chat = msg.get("chat") or {}
-    chat_id = chat.get("id")
-    text = (msg.get("text") or "").strip()
-
-    # bỏ update cũ
-    msg_ts = msg.get("date")
-    if msg_ts and time.time() - msg_ts > MAX_UPDATE_AGE:
-        print("SKIP >>> old update", flush=True)
-        return {"ok": True}
-
-    if text == "/start":
-        tg_send(
-            chat_id,
-            "Xin chào, tôi là DzDay – giọng Dandattone, hơi mỉa nhưng chân thành 😉\n"
-            "Gõ /today để xem hôm nay nhân loại lại bịa ra ngày gì."
-        )
-        log_event(make_log(update, "start", text))
-        return {"ok": True}
-
-    if text == "/today":
-        # check limit
-        if not check_daily_limit(chat_id):
-            tg_send(chat_id, "Hôm nay ông share chăm quá. Muốn tiếp thì rủ thêm 2 đứa vào gõ /start nhé.")
-            log_event(make_log(update, "limit", text, extra={"action": "limit_reached"}))
+        if msg_ts and time.time() - msg_ts > MAX_UPDATE_AGE:
             return {"ok": True}
 
-        # hardcode 1 ngày – Phase 2 sẽ thay bằng AI
-        day_name = "Hôm nay là Ngày Bánh Crepe Toàn Cầu"
-        fun_fact = "Crepe mỏng nhưng ăn nhiều vẫn mập."
-        nonce = generate_nonce()
-        shortlink = f"https://dz.day/today?nonce={nonce}&utm_source=telegram&utm_medium=share_button"
+        if text == "/start":
+            send_msg(chat_id, "Xin chào, tôi là DzDay – giọng Dandattone, hơi mỉa nhưng chân thành 😏\nGõ /today để xem hôm nay nhân loại lại bịa ra ngày gì.")
+            log_event(make_log(update, "start", text))
+        elif text == "/today":
+            if not check_daily_limit(chat_id):
+                send_msg(chat_id, "Hôm nay ông share chăm quá. Muốn tiếp thì rủ thêm 2 đứa vào /start nhé.")
+                return {"ok": True}
 
-        body = (
-            f"🎂 {day_name}\n"
-            f"Không ai bắt ông tin, nhưng người ta bày ra để có cớ trộn bột rồi đổ mỏng cho sang.\n"
-            f"Fun fact: {fun_fact}\n"
-            f"#viaDzDay {shortlink}"
-        )
+            nonce = generate_nonce()
+            day_name = "Ngày Bánh Crepe Toàn Cầu"
+            fun_fact = "Crepe mỏng nhưng ăn nhiều vẫn mập."
+            caption = build_caption("mia_nhe", day_name, fun_fact, nonce)
+            img = generate_card(day_name, fun_fact, nonce)
 
-        reply_markup = {
-            "inline_keyboard": [[
-                {"text": "📤 Share Story", "callback_data": f"share:{nonce}"},
-                {"text": "📋 Copy Caption", "callback_data": f"copy:{nonce}"},
-                {"text": "💡 Suggest Day", "callback_data": "suggest"},
-            ]]
-        }
+            # Inline buttons
+            buttons = {
+                "inline_keyboard": [[
+                    {"text": "📤 Share Story", "callback_data": f"share:{nonce}"},
+                    {"text": "📋 Copy Caption", "callback_data": f"copy:{nonce}"},
+                    {"text": "💡 Suggest Day", "callback_data": "suggest"}
+                ]]
+            }
 
-        tg_send(chat_id, body, reply_markup=reply_markup)
-
-        log_event(make_log(update, "today", text, extra={
-            "nonce": nonce,
-            "action": "today",
-            "caption_preset": "mia_nhe",
-        }))
-
-        return {"ok": True}
-
-    if text.startswith("/suggest"):
-        idea = text.replace("/suggest", "", 1).strip()
-        if not idea:
-            tg_send(chat_id, "Gửi kiểu này nè: /suggest Ngày thế giới ăn bún riêu")
-            log_event(make_log(update, "suggest_prompt", text, extra={"action": "suggest_prompt"}))
+            send_photo(chat_id, img, caption, buttons)
+            log_event(make_log(update, "today", text, nonce=nonce))
+        elif text.startswith("/suggest"):
+            idea = text.replace("/suggest", "", 1).strip()
+            if not idea:
+                send_msg(chat_id, "Gửi kiểu này nè: `/suggest Ngày thế giới ăn bún riêu`.", parse_mode="Markdown")
+            else:
+                send_msg(chat_id, f"Đã ghi nhận gợi ý của ông: “{idea}”. Tôi sẽ chê trước rồi mới duyệt.")
+                log_event(make_log(update, "suggest", idea))
         else:
-            tg_send(chat_id, f"Đã ghi nhận gợi ý của ông: “{idea}”. Tôi sẽ chê trước rồi mới duyệt.")
-            log_event(make_log(update, "suggest", idea, extra={"action": "suggest"}))
-        return {"ok": True}
+            send_msg(chat_id, f"Tôi nghe không rõ lắm: {text}\nGõ /today hoặc /suggest cho tử tế.")
+            log_event(make_log(update, "unknown", text))
 
-    # fallback
-    tg_send(chat_id, "Tôi nghe không rõ lắm. Gõ /today hoặc /suggest cho tử tế.")
-    log_event(make_log(update, "unknown", text))
+    # handle callback
+    elif "callback_query" in update:
+        cq = update["callback_query"]
+        chat_id = cq["from"]["id"]
+        data = cq["data"]
+        msg = cq.get("message", {})
+
+        if data.startswith("share:"):
+            nonce = data.split(":")[1]
+            link = f"https://dz.day/today?nonce={nonce}&utm_source=telegram&utm_medium=share_button"
+            send_msg(chat_id, f"Ông share card này nhé 👉 {link}\n#viaDzDay")
+            log_event(make_log(update, "share", data, nonce=nonce, action="share"))
+
+        elif data.startswith("copy:"):
+            nonce = data.split(":")[1]
+            day_name = "Ngày Bánh Crepe Toàn Cầu"
+            fun_fact = "Crepe mỏng nhưng ăn nhiều vẫn mập."
+            caption = build_caption("mia_nhe", day_name, fun_fact, nonce)
+            send_msg(chat_id, caption)
+            log_event(make_log(update, "copy", data, nonce=nonce, action="copy", caption_preset="mia_nhe"))
+
+        elif data == "suggest":
+            send_msg(chat_id, "Gửi gợi ý bằng lệnh: /suggest Tên ngày nhé.\nVí dụ: /suggest Ngày thế giới ăn bún riêu")
+            log_event(make_log(update, "suggest_prompt", data, action="suggest"))
+
     return {"ok": True}
 
+# === Telegram senders ===
+def send_msg(chat_id, text, parse_mode=None):
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    requests.post(f"{API_URL}/sendMessage", json=payload, timeout=10)
 
-# -------------------------------------------------
-# callback
-# -------------------------------------------------
-def handle_callback(update):
-    cb = update.get("callback_query") or {}
-    data = cb.get("data") or ""
-    chat = cb.get("message", {}).get("chat", {}) or {}
-    chat_id = chat.get("id")
+def send_photo(chat_id, photo_bytes, caption, buttons=None):
+    files = {"photo": ("card.jpg", photo_bytes, "image/jpeg")}
+    data = {"chat_id": chat_id, "caption": caption}
+    if buttons:
+        data["reply_markup"] = buttons
+    requests.post(f"{API_URL}/sendPhoto", data=data, files=files, timeout=15)
 
-    # bắt buộc trả lời callback để Telegram khỏi quay
-    if API_URL and cb.get("id"):
-        try:
-            requests.post(f"{API_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"]}, timeout=5)
-        except Exception as e:
-            print("ANSWER CB ERR >>>", e, flush=True)
+# === Logging ===
+def make_log(update, command, text, nonce="", action="", caption_preset=""):
+    msg = update.get("message") or update.get("callback_query", {}).get("message", {}) or {}
+    user = (msg.get("from") or update.get("callback_query", {}).get("from", {})) or {}
+    return {
+        "chat_id": msg.get("chat", {}).get("id") or user.get("id"),
+        "username": user.get("username") or user.get("first_name") or "",
+        "text": text,
+        "command": command,
+        "raw": update,
+        "source": "telegram",
+        "nonce": nonce,
+        "action": action,
+        "caption_preset": caption_preset,
+        "timestamp": datetime.utcnow().isoformat()
+    }
 
-    if data.startswith("share:"):
-        nonce = data.split(":", 1)[1]
-        link = f"https://dz.day/today?nonce={nonce}&utm_source=telegram&utm_medium=share_button"
-        tg_send(chat_id, f"Ông share card này nhé 👉 {link}\n#viaDzDay")
-        log_event(make_log(update, "share", data, extra={
-            "nonce": nonce,
-            "action": "share",
-        }))
-        return {"ok": True}
+def log_event(payload):
+    if not LOG_URL:
+        print("LOG >>> skipped", flush=True)
+        return
+    try:
+        r = requests.post(LOG_URL, json=payload, timeout=5)
+        print("LOG >>>", r.status_code, r.text[:200], flush=True)
+    except Exception as e:
+        print("LOG ERR >>>", e, flush=True)
 
-    if data.startswith("copy:"):
-        nonce = data.split(":", 1)[1]
-        caption = build_caption(
-            "mia_nhe",
-            "Hôm nay là Ngày Bánh Crepe Toàn Cầu",
-            "Crepe mỏng nhưng ăn nhiều vẫn mập.",
-            nonce
-        )
-        tg_send(chat_id, caption)
-        log_event(make_log(update, "copy", data, extra={
-            "nonce": nonce,
-            "action": "copy",
-            "caption_preset": "mia_nhe",
-        }))
-        return {"ok": True}
-
-    if data == "suggest":
-        tg_send(chat_id, "Gửi gợi ý bằng lệnh: /suggest Tên ngày nhé.")
-        log_event(make_log(update, "suggest_prompt", data, extra={
-            "action": "suggest_prompt",
-        }))
-        return {"ok": True}
-
-    # nếu callback lạ
-    log_event(make_log(update, "callback_unknown", data, extra={"action": "callback_unknown"}))
-    return {"ok": True}
-
-
-# -------------------------------------------------
-# keep warm
-# -------------------------------------------------
+# === Keep alive ===
 def keep_warm():
     if not SELF_URL:
         return
@@ -295,5 +208,7 @@ def keep_warm():
             print("WARM ERR >>>", e, flush=True)
         time.sleep(25)
 
-
 threading.Thread(target=keep_warm, daemon=True).start()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)

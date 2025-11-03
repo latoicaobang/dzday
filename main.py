@@ -12,7 +12,7 @@ SELF_URL  = os.getenv("SELF_URL")
 LOG_URL   = os.getenv("LOG_URL")
 
 MAX_UPDATE_AGE = 90  # seconds
-DAILY_LIMIT    = {}  # in-memory: {f"{chat_id}_{YYYY-MM-DD}": count}
+DAILY_LIMIT    = {}  # memory store
 
 # ---------- helpers ----------
 def generate_nonce(k: int = 8):
@@ -30,36 +30,49 @@ def build_caption(preset: str, day_name: str, fun_fact: str, nonce: str) -> str:
         return f"🤣 Hôm nay là {day_name}!\nLý do? Vì nhân loại rảnh quá thôi.\nFun fact: {fun_fact}\n#viaDzDay {link}"
     if preset == "trung_tinh":
         return f"📅 {day_name}\nFun fact: {fun_fact}\n#viaDzDay {link}"
-    # default mia_nhe
     return f"🎂 Hôm nay là {day_name}\nKhông ai bắt ông tin, nhưng người ta bịa ra đấy.\nFun fact: {fun_fact}\n#viaDzDay {link}"
 
-def _safe_font(size: int):
-    # Try common fonts, then fall back to default bitmap font
-    for name in ("DejaVuSans.ttf", "Arial.ttf", "arial.ttf"):
-        try:
-            return ImageFont.truetype(name, size)
-        except Exception:
-            pass
-    return ImageFont.load_default()
+# ---------- card generator ----------
+def _safe_font(size: int, italic=False):
+    try:
+        if italic:
+            return ImageFont.truetype("assets/Playfair-Italic.ttf", size)
+        return ImageFont.truetype("assets/Playfair.ttf", size)
+    except Exception:
+        return ImageFont.load_default()
 
 def generate_card(day_name: str, fun_fact: str, nonce: str) -> io.BytesIO:
-    # 1080×1350 portrait
     W, H = 1080, 1350
-    bg = Image.new("RGB", (W, H), color=(245, 240, 230))
+    bg_color = (249, 245, 240)
+    text_color = (30, 25, 20)
+    accent_color = (100, 90, 85)
+
+    bg = Image.new("RGB", (W, H), color=bg_color)
     draw = ImageDraw.Draw(bg)
 
-    title_f = _safe_font(64)
-    body_f  = _safe_font(38)
-    small_f = _safe_font(30)
+    # fonts
+    title_f = _safe_font(86)
+    body_f = _safe_font(44)
+    italic_f = _safe_font(40, italic=True)
+    small_f = _safe_font(34)
 
-    # content
-    y = 140
-    draw.text((80, y), f"🎂 {day_name}", font=title_f, fill=(30, 30, 30))
-    y += 120
+    # title
+    y = 180
+    draw.text((100, y), f"🎂 {day_name}", font=title_f, fill=text_color)
+
+    # body
+    y += 180
     body = "Không ai bắt ông tin, nhưng người ta bày ra để có cớ trộn bột rồi đổ mỏng cho sang."
-    draw.text((80, y), body, font=body_f, fill=(60, 60, 60))
-    y += 200
-    draw.text((80, y), f"Fun fact: {fun_fact}", font=body_f, fill=(70, 70, 70))
+    draw.multiline_text((100, y), body, font=body_f, fill=accent_color, spacing=10)
+
+    # fun fact
+    y += 260
+    draw.text((100, y), f"Fun fact:", font=italic_f, fill=text_color)
+    draw.text((270, y), fun_fact, font=body_f, fill=text_color)
+
+    # watermark
+    draw.text((100, H - 180), "#viaDzDay", font=small_f, fill=(110, 100, 95))
+    draw.text((100, H - 120), "dz.day/today", font=small_f, fill=(130, 120, 110))
 
     # QR
     link_qr = f"https://dz.day/today?nonce={nonce}&utm_source=telegram&utm_medium=qr"
@@ -67,16 +80,12 @@ def generate_card(day_name: str, fun_fact: str, nonce: str) -> io.BytesIO:
     qr.add_data(link_qr)
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").resize((220, 220))
-    bg.paste(qr_img, (W - 260, H - 280))
+    bg.paste(qr_img, (W - 280, H - 280))
 
-    # watermarks
-    draw.text((80, H - 160), "#viaDzDay", font=small_f, fill=(100, 100, 100))
-    draw.text((80, H - 100), "dz.day/today", font=small_f, fill=(120, 120, 120))
-
-    buff = io.BytesIO()
-    bg.save(buff, format="JPEG", quality=90)
-    buff.seek(0)
-    return buff
+    buf = io.BytesIO()
+    bg.save(buf, format="JPEG", quality=92)
+    buf.seek(0)
+    return buf
 
 # ---------- telegram senders ----------
 def send_msg(chat_id, text, parse_mode=None):
@@ -93,7 +102,6 @@ def send_photo(chat_id, photo_bytes: io.BytesIO, caption: str, buttons: dict | N
     if not API_URL: return
     data = {"chat_id": chat_id, "caption": caption}
     if buttons:
-        # must be JSON string for multipart/form-data
         data["reply_markup"] = json.dumps(buttons)
     files = {"photo": ("card.jpg", photo_bytes, "image/jpeg")}
     try:
@@ -170,7 +178,6 @@ def webhook():
                 {"text": "💡 Suggest Day", "callback_data": "suggest"}
             ]]}
 
-            # Try to send card; if anything fails, send text fallback
             try:
                 img = generate_card(day_name, fun_fact, nonce)
                 send_photo(chat_id, img, caption, buttons)
@@ -190,7 +197,6 @@ def webhook():
                 log_event(make_log(update, "suggest", idea))
             return {"ok": True}
 
-        # default
         send_msg(chat_id, f"Tôi nghe không rõ lắm: {text}\nGõ /today hoặc /suggest cho tử tế.")
         log_event(make_log(update, "unknown", text))
         return {"ok": True}

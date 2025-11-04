@@ -87,7 +87,6 @@ def build_caption(preset, day_name, fun_fact, nonce):
                 f"Fun fact: {fun_fact}")
     return f"{body}\n#viaDzDay {link}"
 
-# ---------- Card renderer (square) ----------
 def render_card_square(title, body, fun_fact, short_url):
     theme = pick_theme_by_today()
     bg, card, fg, sub, chip_color = theme["bg"], theme["card"], theme["fg"], theme["sub"], theme["chip"]
@@ -101,14 +100,19 @@ def render_card_square(title, body, fun_fact, short_url):
     inner_pad = 64
     cx, cy = inner_pad, inner_pad
     cw, ch = card_img.size
-    inner_w = cw - inner_pad*2
     d = ImageDraw.Draw(card_img)
+
+    # --- QR block (định trước kích thước & gutter để trừ cột phải) ---
+    QR_SIZE = 300
+    QR_FRAME = 36  # khung trắng quanh QR
+    qr_total = QR_SIZE + QR_FRAME
+    RIGHT_GUTTER = qr_total + 40  # chừa thêm khoảng thở
 
     # fonts
     title_size = 86
     title_font = load_font(FONT_REG_PATH, title_size)
     def ok(f):
-        l,_ = text_wrap(d, title, f, inner_w, lh_mult=1.10)
+        l,_ = text_wrap(d, title, f, (cw - inner_pad*2 - RIGHT_GUTTER), lh_mult=1.10)
         return len(l) <= 3
     while not ok(title_font) and title_size > 48:
         title_size -= 4
@@ -117,6 +121,9 @@ def render_card_square(title, body, fun_fact, short_url):
     body_font   = load_font(FONT_REG_PATH, 40)
     italic_font = load_font(FONT_ITALIC_PATH, 42)
     small_font  = load_font(FONT_REG_PATH, 34)
+
+    # vùng nội dung thực sự (đã trừ cột phải cho QR)
+    inner_w = cw - inner_pad*2 - RIGHT_GUTTER
 
     # title
     t_lines, t_h = text_wrap(d, title, title_font, inner_w, lh_mult=1.10)
@@ -130,15 +137,15 @@ def render_card_square(title, body, fun_fact, short_url):
     draw_multiline(d, (cx, cy), b_lines, body_font, sub, b_lh)
     cy += b_h + GAP
 
-    # fun fact with italic tag
+    # fun fact + nhãn italic
     tag = "Fun fact:"
     tag_w = d.textlength(tag, font=italic_font)
     f_lines, _ = text_wrap(d, fun_fact, body_font, inner_w - tag_w - 12, lh_mult=1.35)
     d.text((cx, cy), tag, font=italic_font, fill=sub)
     d.text((cx + tag_w + 12, cy), f_lines[0], font=body_font, fill=fg)
-    cy += b_lh
+    cy2 = cy + b_lh
     for ln in f_lines[1:]:
-        d.text((cx, cy), ln, font=body_font, fill=fg); cy += b_lh
+        d.text((cx, cy2), ln, font=body_font, fill=fg); cy2 += b_lh
 
     # footer chips
     chip_px, chip_py = 20, 10
@@ -155,15 +162,16 @@ def render_card_square(title, body, fun_fact, short_url):
     left_x += w1 + 12
     draw_chip("dz.day/today", left_x, cy_footer)
 
-    # QR
-    qr = qrcode.make(short_url).resize((300, 300))
-    qr_bg = Image.new("RGB", (336, 336), "white")
-    qr_bg.paste(qr, (18, 18))
-    qr_x = cw - inner_pad - qr_bg.size[0]
-    qr_y = cy_footer - qr_bg.size[1]
+    # QR (dán góc phải dưới, trong cột riêng)
+    qr_img = qrcode.make(short_url).resize((QR_SIZE, QR_SIZE))
+    qr_bg = Image.new("RGB", (qr_total, qr_total), "white")
+    off = QR_FRAME // 2
+    qr_bg.paste(qr_img, (off, off))
+    qr_x = cw - inner_pad - qr_total
+    qr_y = cy_footer - qr_total
     card_img.paste(qr_bg, (qr_x, qr_y))
 
-    # paste card with rounded mask
+    # paste card với bo góc
     mask = Image.new("L", card_img.size, 0)
     ImageDraw.Draw(mask).rounded_rectangle((0,0,card_img.size[0], card_img.size[1]), radius=CARD_R, fill=255)
     base.paste(card_img, card_box[:2], mask)
@@ -217,9 +225,33 @@ def webhook():
         log_event(make_log(update, "start", text))
 
     elif text == "/today":
-        if not ensure_daily_limit(chat_id):
-            send_msg(chat_id, "Hôm nay bạn share chăm quá. Muốn tiếp thì rủ thêm 2 đứa vào gõ /start nhé.")
-            log_event(make_log(update, "limit", text)); return {"ok": True}
+    if not ensure_daily_limit(chat_id):
+        send_msg(chat_id, "Hôm nay bạn share chăm quá. Muốn tiếp thì rủ thêm 2 đứa vào gõ /start nhé.")
+        log_event(make_log(update, "limit", text)); return {"ok": True}
+
+    today = dt.datetime.utcnow()
+    title_text = f"Ngày Bánh Crepe Toàn Cầu {today.day}/{today.month}"
+    body = "Không ai bắt bạn tin, nhưng người ta bày ra để có cớ trộn bột rồi đổ mỏng cho sang."
+    fun  = "Crepe mỏng nhưng ăn nhiều vẫn mập."
+
+    nonce = generate_nonce()
+    short_link = f"https://dz.day/today?nonce={nonce}&utm_source=telegram&utm_medium=share_button"
+
+    img_buf = render_card_square(title_text, body, fun, short_link)
+    caption = build_caption("mia_nhe", "Ngày Bánh Crepe Toàn Cầu", fun, nonce)
+
+    kb = {
+        "inline_keyboard":[
+            [
+                {"text":"📤 Share Story","callback_data":f"share:{nonce}"},
+                {"text":"📋 Copy Caption","callback_data":f"copy:{nonce}"},
+                {"text":"💡 Suggest Day","callback_data":"suggest"},
+            ]
+        ]
+    }
+
+    send_photo(chat_id, img_buf, caption=caption, buttons=kb)
+    log_event(make_log(update, "today", text, nonce=nonce, caption_preset="mia_nhe", action="render"))
 
         today = dt.datetime.utcnow()
         title_text = f"Ngày Bánh Crepe Toàn Cầu {today.day}/{today.month}"
@@ -256,11 +288,12 @@ def send_msg(chat_id, text, parse_mode=None):
     r = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=15)
     print("SEND >>>", r.text, flush=True)
 
-def send_photo(chat_id, img_buf, caption=None):
+def send_photo(chat_id, img_buf, caption=None, buttons=None):
     if not API_URL: return
     files = {"photo": ("dzcard.jpg", img_buf, "image/jpeg")}
     data = {"chat_id": chat_id}
-    if caption: data["caption"] = caption  # không gán parse_mode
+    if caption: data["caption"] = caption    # không set parse_mode để tránh lỗi URL
+    if buttons: data["reply_markup"] = json.dumps(buttons)
     r = requests.post(f"{API_URL}/sendPhoto", data=data, files=files, timeout=30)
     print("PHOTO >>>", r.text, flush=True)
 

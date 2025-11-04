@@ -16,15 +16,43 @@ LOG_URL     = os.getenv("LOG_URL")         # Google Apps Script endpoint
 MAX_UPDATE_AGE = 90
 
 # ===== Font paths (Playfair Display) =====
-FONT_REG_PATH = os.path.join("assets", "Playfair.ttf")
-FONT_ITA_PATH = os.path.join("assets", "Playfair-Italic.ttf")
+import pathlib
 
-def _assert_font(path, label):
-    if not os.path.exists(path):
-        print(f"[FONT ERR] {label} not found at {path}. Make sure Playfair files exist.", flush=True)
+BASE_DIR = pathlib.Path(__file__).resolve().parent
 
-_assert_font(FONT_REG_PATH, "Playfair Regular")
-_assert_font(FONT_ITA_PATH, "Playfair Italic")
+# Tìm các khả năng đặt tên file phổ biến
+FONT_CANDIDATES_REG = [
+    BASE_DIR / "assets" / "Playfair.ttf",
+    BASE_DIR / "assets" / "PlayfairDisplay-Regular.ttf",
+    BASE_DIR / "assets" / "PlayfairDisplay.ttf",
+]
+FONT_CANDIDATES_ITA = [
+    BASE_DIR / "assets" / "Playfair-Italic.ttf",
+    BASE_DIR / "assets" / "PlayfairDisplay-Italic.ttf",
+]
+
+def _pick_font(candidates, label):
+    for p in candidates:
+        if p.exists():
+            print(f"[FONT] {label} => {p}", flush=True)
+            return str(p)
+    print(f"[FONT ERR] {label} not found. Looked for: {[str(x) for x in candidates]}", flush=True)
+    return None
+
+FONT_REG_PATH = _pick_font(FONT_CANDIDATES_REG, "Playfair Regular")
+FONT_ITA_PATH = _pick_font(FONT_CANDIDATES_ITA, "Playfair Italic")
+
+def load_font(size, italic=False):
+    """Load Playfair (ưu tiên), nếu fail rớt về default và in log."""
+    path = FONT_ITA_PATH if italic else FONT_REG_PATH
+    try:
+        if path is None:
+            raise FileNotFoundError("Font path is None")
+        # Pillow chấp nhận cả path string hoặc file-like object
+        return ImageFont.truetype(path, size)
+    except Exception as e:
+        print(f"[FONT LOAD ERR] {path}: {e}. Falling back to default.", flush=True)
+        return ImageFont.load_default()
 
 # ===== Runtime state =====
 DAILY_LIMIT = 10

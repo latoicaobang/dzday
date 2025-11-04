@@ -1,126 +1,383 @@
-# main.py — DzDay (DzCard v2.1, Playfair Display, VN date, neutral tone)
-
+# main.py — DzDay v3 (Square, Mobile-first)
 from flask import Flask, request
-import os, io, json, time, random, string, threading, datetime as dt
+import os, io, time, threading, json, math, random, string, datetime as dt
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import qrcode
 
+# -------------------------
+# Config & constants
+# -------------------------
 app = Flask(__name__)
 
-# ===== ENV =====
 BOT_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 API_URL     = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
-SELF_URL    = os.getenv("SELF_URL")        # https://<app>.up.railway.app/
-LOG_URL     = os.getenv("LOG_URL")         # Google Apps Script endpoint
+SELF_URL    = os.getenv("SELF_URL")          # https://<railway-app>.up.railway.app/
+LOG_URL     = os.getenv("LOG_URL")           # Google Apps Script endpoint
 MAX_UPDATE_AGE = 90
 
-# ===== Font paths (Playfair Display) =====
-import pathlib
+# Fonts
+FONT_REG_PATH   = os.getenv("FONT_REG_PATH", "assets/Playfair.ttf")
+FONT_ITALIC_PATH= os.getenv("FONT_ITALIC_PATH", "assets/Playfair-Italic.ttf")
 
-BASE_DIR = pathlib.Path(__file__).resolve().parent
+# Size (mobile-first square)
+CANVAS = (1080, 1080)         # px
+CARD_R = 40                   # card corner radius
+PADDING = 64                  # outer padding
+GAP = 28                      # vertical gaps between elements
 
-# Tìm các khả năng đặt tên file phổ biến
-FONT_CANDIDATES_REG = [
-    BASE_DIR / "assets" / "Playfair.ttf",
-    BASE_DIR / "assets" / "PlayfairDisplay-Regular.ttf",
-    BASE_DIR / "assets" / "PlayfairDisplay.ttf",
-]
-FONT_CANDIDATES_ITA = [
-    BASE_DIR / "assets" / "Playfair-Italic.ttf",
-    BASE_DIR / "assets" / "PlayfairDisplay-Italic.ttf",
-]
-
-def _pick_font(candidates, label):
-    for p in candidates:
-        if p.exists():
-            print(f"[FONT] {label} => {p}", flush=True)
-            return str(p)
-    print(f"[FONT ERR] {label} not found. Looked for: {[str(x) for x in candidates]}", flush=True)
-    return None
-
-FONT_REG_PATH = _pick_font(FONT_CANDIDATES_REG, "Playfair Regular")
-FONT_ITA_PATH = _pick_font(FONT_CANDIDATES_ITA, "Playfair Italic")
-
-def load_font(size, italic=False):
-    """Load Playfair (ưu tiên), nếu fail rớt về default và in log."""
-    path = FONT_ITA_PATH if italic else FONT_REG_PATH
-    try:
-        if path is None:
-            raise FileNotFoundError("Font path is None")
-        # Pillow chấp nhận cả path string hoặc file-like object
-        return ImageFont.truetype(path, size)
-    except Exception as e:
-        print(f"[FONT LOAD ERR] {path}: {e}. Falling back to default.", flush=True)
-        return ImageFont.load_default()
-
-# ===== Runtime state =====
-DAILY_LIMIT = 10
-user_exports = {}   # {date_str: {chat_id: count}}
-
-# ===== Caption presets =====
-PRESETS = {
-    "mia_nhe":   ("Không ai bắt bạn tin, nhưng người ta bày ra để có cớ làm chuyện nhỏ cho sang.",),
-    "tau_hai":   ("Cứ cho là nhân loại rảnh, nhưng cái rảnh này cũng đáng để cười nhẹ một cái.",),
-    "trung_tinh":("Ghi chú hôm nay cho lịch sử cá nhân, khỏi lẫn vào mai.",)
+# Theme (auto by odd/even day)
+THEMES = {
+    "ivory": {
+        "bg":   (243, 238, 231),
+        "card": (255, 255, 255),
+        "fg":   (36, 34, 30),
+        "sub":  (94, 92, 88),
+        "chip": (245, 242, 238),
+    },
+    "night": {
+        "bg":   (14, 15, 19),
+        "card": (24, 26, 32),
+        "fg":   (238, 238, 240),
+        "sub":  (170, 170, 176),
+        "chip": (36, 38, 44),
+    },
 }
 
-# ---------- Time helpers (VN) ----------
-VN_OFFSET = dt.timedelta(hours=7)
+# In-memory limit per day
+LIMIT = {}
+LIMIT_MAX = 10
 
-def now_utc():
-    return dt.datetime.utcnow()
+# -------------------------
+# Utilities
+# -------------------------
+def iso_now():
+    return dt.datetime.utcnow().isoformat()
 
-def now_vn():
-    return now_utc() + VN_OFFSET
-
-def today_key():
-    return now_vn().strftime("%Y-%m-%d")
-
-def vn_day_month():
-    n = now_vn()
-    return f"{n.day}/{n.month}"
-
-def now_iso():
-    return now_utc().isoformat() + "Z"
-
-# ---------- Misc ----------
 def generate_nonce(n=8):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
-def shortlink_with_nonce(nonce):
-    return f"https://dz.day/today?nonce={nonce}&utm_source=telegram&utm_medium=share_button"
+def pick_theme_by_today():
+    # Even day -> ivory, odd -> night
+    day = dt.datetime.utcnow().day
+    return THEMES["ivory"] if (day % 2 == 0) else THEMES["night"]
 
-def check_daily_limit(chat_id):
-    key = today_key()
-    if key not in user_exports:
-        user_exports[key] = {}
-    cnt = user_exports[key].get(chat_id, 0)
-    if cnt >= DAILY_LIMIT:
+def load_font(path, size):
+    try:
+        return ImageFont.truetype(path, size=size)
+    except Exception:
+        # Fallback to default PIL
+        return ImageFont.load_default()
+
+def text_wrap(draw, text, font, max_w, line_height_mult=1.15):
+    """
+    Greedy wrap text into lines fitting max_w. Returns (lines, total_height)
+    """
+    words = text.split()
+    if not words:
+        return [], 0
+    lines, cur = [], words[0]
+    for w in words[1:]:
+        test = cur + " " + w
+        if draw.textlength(test, font=font) <= max_w:
+            cur = test
+        else:
+            lines.append(cur)
+            cur = w
+    lines.append(cur)
+    # Height estimate
+    ascent, descent = font.getmetrics()
+    line_h = int((ascent + descent) * line_height_mult)
+    return lines, line_h * len(lines)
+
+def draw_multiline(draw, xy, lines, font, fill, line_h):
+    x, y = xy
+    for line in lines:
+        draw.text((x, y), line, font=font, fill=fill)
+        y += line_h
+
+def ensure_daily_limit(chat_id):
+    key = dt.datetime.utcnow().strftime("%Y-%m-%d")
+    LIMIT.setdefault(key, {})
+    cnt = LIMIT[key].get(chat_id, 0)
+    if cnt >= LIMIT_MAX:
         return False
-    user_exports[key][chat_id] = cnt + 1
+    LIMIT[key][chat_id] = cnt + 1
     return True
 
-def log_event(payload):
-    if not LOG_URL:
-        print("LOG >>> skipped (no LOG_URL)", flush=True); 
-        return
-    try:
-        r = requests.post(LOG_URL, json=payload, timeout=5)
-        print("LOG >>>", r.status_code, r.text[:200], flush=True)
-    except Exception as e:
-        print("LOG ERR >>>", e, flush=True)
+def build_caption(preset, day_name, fun_fact, nonce):
+    link = f"https://dz.day/today?nonce={nonce}&utm_source=telegram&utm_medium=share_button"
+    if preset == "tau_hai":
+        body = f"🎉 Hôm nay… {day_name}.\nKhông ép bạn tin, nhưng có cớ để vui chút.\nFun fact: {fun_fact}"
+    elif preset == "trung_tinh":
+        body = f"📌 Hôm nay: {day_name}.\nFun fact: {fun_fact}"
+    else:  # mia_nhe
+        body = f"🎂 Hôm nay là {day_name}\nKhông ai bắt bạn tin, nhưng người ta bày ra để có cớ trộn bột rồi đổ mỏng cho sang.\nFun fact: {fun_fact}"
+    return f"{body}\n#viaDzDay {link}"
 
+# -------------------------
+# Card renderer (square)
+# -------------------------
+def render_card_square(title, body, fun_fact, short_url):
+    theme = pick_theme_by_today()
+    bg, card, fg, sub, chip = theme["bg"], theme["card"], theme["fg"], theme["sub"], theme["chip"]
+    W, H = CANVAS
+
+    # Base
+    im = Image.new("RGB", CANVAS, bg)
+    draw = ImageDraw.Draw(im)
+
+    # Card rect with soft shadow
+    card_box = (PADDING, PADDING, W - PADDING, H - PADDING)
+    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    sh_draw = ImageDraw.Draw(shadow)
+    # shadow rectangle
+    for r in range(18):
+        alpha = int(50 * (1 - r / 18))
+        sh_draw.rounded_rectangle(card_box, radius=CARD_R + r, fill=(0, 0, 0, alpha))
+    im = Image.alpha_composite(im.convert("RGBA"), shadow).convert("RGB")
+
+    # Card body
+    card_img = Image.new("RGB", (card_box[2]-card_box[0], card_box[3]-card_box[1]), card)
+    # inner padding
+    inner_pad = 64
+    cx, cy = inner_pad, inner_pad
+    cw, ch = card_img.size
+    inner_w = cw - inner_pad*2
+
+    d = ImageDraw.Draw(card_img)
+
+    # Load fonts (adaptive sizes)
+    # Title scaling: start large, shrink until fits <= 3 lines
+    title_size = 86
+    title_font = load_font(FONT_REG_PATH, title_size)
+    def title_lines_ok(f):
+        lines, _ = text_wrap(d, title, f, inner_w, line_height_mult=1.10)
+        return len(lines) <= 3
+    while not title_lines_ok(title_font) and title_size > 48:
+        title_size -= 4
+        title_font = load_font(FONT_REG_PATH, title_size)
+
+    body_font  = load_font(FONT_REG_PATH, 40)
+    italic_font= load_font(FONT_ITALIC_PATH, 42)
+    small_font = load_font(FONT_REG_PATH, 34)
+
+    # Title
+    title_lines, title_h = text_wrap(d, title, title_font, inner_w, line_height_mult=1.10)
+    line_h_t = int(sum(title_font.getmetrics()) * 1.10)
+    draw_multiline(d, (cx, cy), title_lines, title_font, fg, line_h_t)
+    cy += title_h + GAP
+
+    # Body (paragraph)
+    body_lines, body_h = text_wrap(d, body, body_font, inner_w, line_height_mult=1.35)
+    line_h_b = int(sum(body_font.getmetrics()) * 1.35)
+    draw_multiline(d, (cx, cy), body_lines, body_font, sub, line_h_b)
+    cy += body_h + GAP
+
+    # Fun fact with italic tag
+    tag = "Fun fact:"
+    tag_w = d.textlength(tag, font=italic_font)
+    # Wrap fact after the tag; ensure first line has tag at start
+    fact_lines, _ = text_wrap(d, fun_fact, body_font, inner_w - tag_w - 12, line_height_mult=1.35)
+    line_h_f = line_h_b
+
+    # Draw first line with tag italic
+    d.text((cx, cy), tag, font=italic_font, fill=sub)
+    d.text((cx + tag_w + 12, cy), fact_lines[0], font=body_font, fill=fg)
+    cy += line_h_f
+    for ln in fact_lines[1:]:
+        d.text((cx, cy), ln, font=body_font, fill=fg)
+        cy += line_h_f
+
+    # Footer row (left: watermark chips; right: QR)
+    cy_footer = ch - inner_pad
+
+    # Watermark chips
+    chip_pad_x = 20
+    chip_pad_y = 10
+
+    def draw_chip(text, x, y):
+        w = int(d.textlength(text, font=small_font) + chip_pad_x*2)
+        h = int(sum(small_font.getmetrics()) * 1.15 + chip_pad_y*2)
+        d.rounded_rectangle((x, y-h, x+w, y), radius=14, fill=chip)
+        d.text((x+chip_pad_x, y-h+chip_pad_y), text, font=small_font, fill=sub)
+        return w, h
+
+    left_x = cx
+    w1, h1 = draw_chip("#viaDzDay", left_x, cy_footer)
+    left_x += w1 + 12
+    w2, h2 = draw_chip("dz.day/today", left_x, cy_footer)
+
+    # QR (rounded white bg)
+    qr_size = 300
+    qr_img = qrcode.make(short_url)
+    qr_img = qr_img.resize((qr_size, qr_size), Image.NEAREST)
+    qr_bg = Image.new("RGB", (qr_size+36, qr_size+36), "white")
+    qr_bg_draw = ImageDraw.Draw(qr_bg)
+    qr_bg_draw.rounded_rectangle((0,0,qr_bg.size[0]-1, qr_bg.size[1]-1), radius=24, fill="white")
+    qr_bg.paste(qr_img, (18, 18))
+
+    qr_x = cw - inner_pad - qr_bg.size[0]
+    qr_y = cy_footer - qr_bg.size[1]  # align bottom
+    card_img.paste(qr_bg, (qr_x, qr_y))
+
+    # Paste card into canvas
+    # mask for rounded corners
+    mask = Image.new("L", card_img.size, 0)
+    mdraw = ImageDraw.Draw(mask)
+    mdraw.rounded_rectangle((0, 0, card_img.size[0], card_img.size[1]), radius=CARD_R, fill=255)
+    im.paste(card_img, card_box[:2], mask)
+
+    # Export to bytes
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=92, subsampling=1)
+    buf.seek(0)
+    return buf
+
+# -------------------------
+# Flask routes
+# -------------------------
+@app.route("/", methods=["GET"])
+def index():
+    return "DzDayBot alive"
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    update = request.get_json()
+    print("UPDATE >>>", update, flush=True)
+    if not update:
+        return {"ok": True}
+
+    # Callback buttons
+    if "callback_query" in update:
+        cq = update["callback_query"]
+        data = cq.get("data", "")
+        msg  = cq.get("message", {})
+        chat_id = msg.get("chat", {}).get("id")
+        nonce = ""
+        action = ""
+        if ":" in data:
+            action, nonce = data.split(":", 1)
+        else:
+            action = data
+
+        if action == "share":
+            send_msg(chat_id, f"Bạn share card này nhé 👉 https://dz.day/today?nonce={nonce}\n#viaDzDay")
+            log_event(make_log(update, "share", f"share:{nonce}", nonce=nonce, action="share"))
+        elif action == "copy":
+            cap = build_caption("mia_nhe", "Ngày Bánh Crepe Toàn Cầu", "Crepe mỏng nhưng ăn nhiều vẫn mập.", nonce)
+            send_msg(chat_id, cap)
+            log_event(make_log(update, "copy", f"copy:{nonce}", nonce=nonce, action="copy", caption_preset="mia_nhe"))
+        elif action == "suggest":
+            send_msg(chat_id, "Gửi gợi ý bằng lệnh: /suggest Tên ngày nhé.\nVí dụ: /suggest Ngày thế giới ăn bún riêu")
+            log_event(make_log(update, "suggest_prompt", "suggest", action="suggest"))
+        return {"ok": True}
+
+    # Messages
+    msg = update.get("message", {})
+    chat = msg.get("chat", {})
+    chat_id = chat.get("id")
+    text = (msg.get("text") or "").strip()
+    msg_ts = msg.get("date")
+
+    if msg_ts and time.time() - msg_ts > MAX_UPDATE_AGE:
+        print("SKIP >>> old update", flush=True)
+        return {"ok": True}
+
+    if text == "/start":
+        send_msg(chat_id, "Xin chào, tôi là DzDay – giọng Dandattone, hơi mỉa nhưng chân thành 😉\nGõ /today để xem hôm nay nhân loại lại bịa ra ngày gì.")
+        log_event(make_log(update, "start", text))
+
+    elif text == "/today":
+        if not ensure_daily_limit(chat_id):
+            send_msg(chat_id, "Hôm nay bạn share chăm quá. Muốn tiếp thì rủ thêm 2 đứa vào gõ /start nhé.")
+            log_event(make_log(update, "limit", text))
+            return {"ok": True}
+
+        # Fake data source (Phase 4 sẽ thay bằng nguồn thật)
+        today = dt.datetime.utcnow()
+        title_text = f"Ngày Bánh Crepe Toàn Cầu {today.day}/{today.month}"
+        body = "Không ai bắt bạn tin, nhưng người ta bày ra để có cớ trộn bột rồi đổ mỏng cho sang."
+        fun = "Crepe mỏng nhưng ăn nhiều vẫn mập."
+
+        nonce = generate_nonce()
+        short_link = f"https://dz.day/today?nonce={nonce}&utm_source=telegram&utm_medium=share_button"
+
+        # Render square card
+        img_buf = render_card_square(title_text, body, fun, short_link)
+
+        # Send photo + caption (for mobile consumption)
+        caption = build_caption("mia_nhe", "Ngày Bánh Crepe Toàn Cầu", fun, nonce)
+        send_photo(chat_id, img_buf, caption=caption)
+
+        # Buttons
+        send_inline_buttons(chat_id, nonce)
+
+        log_event(make_log(update, "today", text, nonce=nonce, caption_preset="mia_nhe", action="render"))
+    elif text.startswith("/suggest"):
+        idea = text.replace("/suggest", "", 1).strip()
+        if not idea:
+            send_msg(chat_id, "Gửi kiểu này nè: /suggest Ngày thế giới ăn bún riêu")
+        else:
+            send_msg(chat_id, f"Đã ghi nhận gợi ý của bạn: “{idea}”. Tôi sẽ chê trước rồi mới duyệt.")
+            log_event(make_log(update, "suggest", idea, action="suggest"))
+    else:
+        send_msg(chat_id, f"Tôi nghe chưa rõ lắm: {text}\nGõ /today hoặc /suggest cho tử tế.")
+        log_event(make_log(update, "unknown", text))
+
+    return {"ok": True}
+
+# -------------------------
+# Telegram helpers
+# -------------------------
+def send_msg(chat_id, text, parse_mode=None):
+    if not API_URL:
+        print("NO TOKEN", flush=True); return
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    r = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=15)
+    print("SEND >>>", r.text, flush=True)
+
+def send_photo(chat_id, img_buf, caption=None):
+    if not API_URL:
+        return
+    files = {"photo": ("dzcard.jpg", img_buf, "image/jpeg")}
+    data = {"chat_id": chat_id}
+    if caption:
+        data["caption"] = caption
+        data["parse_mode"] = "Markdown"
+    r = requests.post(f"{API_URL}/sendPhoto", data=data, files=files, timeout=30)
+    print("PHOTO >>>", r.text, flush=True)
+
+def send_inline_buttons(chat_id, nonce):
+    if not API_URL: return
+    kb = {
+        "inline_keyboard":[
+            [
+                {"text":"📤 Share Story","callback_data":f"share:{nonce}"},
+                {"text":"📋 Copy Caption","callback_data":f"copy:{nonce}"},
+                {"text":"💡 Suggest Day","callback_data":"suggest"},
+            ]
+        ]
+    }
+    payload = {"chat_id": chat_id, "text":"", "reply_markup": json.dumps(kb)}
+    # Use sendMessage with zero-width space to only render buttons under the photo
+    payload["text"] = " "
+    r = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=15)
+    print("BTN >>>", r.text, flush=True)
+
+# -------------------------
+# Logging to Google Apps Script
+# -------------------------
 def make_log(update, command, text, nonce="", action="", caption_preset=""):
-    msg = update.get("message") or update.get("callback_query", {}).get("message") or {}
-    user_from_msg = (update.get("message") or {}).get("from") or {}
-    user_from_cq  = (update.get("callback_query") or {}).get("from") or {}
-    user = user_from_msg or user_from_cq
-    username = user.get("username") or user.get("first_name") or "DzDayBot"
-    chat_id = (msg.get("chat") or {}).get("id") or user_from_cq.get("id")
+    msg = update.get("message") or update.get("callback_query", {}).get("message", {}) or {}
+    user = (update.get("message", {}) or update.get("callback_query", {}).get("from", {})).get("from", {}) if "message" in update else update.get("callback_query", {}).get("from", {})
+    if not user:
+        user = update.get("message", {}).get("from", {}) or {}
     return {
-        "chat_id": chat_id,
-        "username": username,
+        "chat_id": msg.get("chat", {}).get("id"),
+        "username": (user.get("username") or user.get("first_name") or "user"),
         "text": text,
         "command": command,
         "raw": update,
@@ -128,264 +385,21 @@ def make_log(update, command, text, nonce="", action="", caption_preset=""):
         "nonce": nonce,
         "action": action,
         "caption_preset": caption_preset,
-        "timestamp": now_iso()
+        "timestamp": iso_now(),
     }
 
-# ---------- Typography (Pillow) ----------
-def load_font(size, italic=False):
-    path = FONT_ITA_PATH if italic else FONT_REG_PATH
+def log_event(payload):
+    if not LOG_URL: 
+        print("LOG >>> skipped", flush=True); return
     try:
-        return ImageFont.truetype(path, size)
+        r = requests.post(LOG_URL, json=payload, timeout=10)
+        print("LOG >>>", r.status_code, r.text[:200], flush=True)
     except Exception as e:
-        print(f"[FONT LOAD ERR] {path}: {e}. Falling back to default.", flush=True)
-        return ImageFont.load_default()
+        print("LOG ERR >>>", e, flush=True)
 
-def wrap_text(draw, text, font, max_width, line_height_mult=1.2):
-    """
-    Trả về (lines, total_height, line_height). Tự xuống dòng khi vượt max_width.
-    """
-    words = text.replace("\n", " \n ").split(" ")
-    lines, current = [], ""
-    for w in words:
-        if w == "\n":
-            lines.append(current.rstrip()); current = ""
-            continue
-        test = (current + " " + w).strip() if current else w
-        if draw.textlength(test, font=font) <= max_width:
-            current = test
-        else:
-            if current:
-                lines.append(current)
-            # Nếu 1 từ quá dài, cắt mềm theo chiều rộng
-            while draw.textlength(w, font=font) > max_width and len(w) > 1:
-                cut = len(w)
-                while cut > 1 and draw.textlength(w[:cut], font=font) > max_width:
-                    cut -= 1
-                lines.append(w[:cut] + "-")
-                w = w[cut:]
-            current = w
-    if current:
-        lines.append(current)
-    ascent, descent = font.getmetrics()
-    line_height = int((ascent + descent) * line_height_mult)
-    total_height = int(len(lines) * line_height)
-    return lines, total_height, line_height
-
-# ---------- Card render ----------
-def render_card(day_name, hook_text, fun_fact, short_url, theme=None):
-    """
-    PNG 1080x1350, text bọc trong content box, Playfair Display.
-    """
-    W, H = 1080, 1350
-    THEMES = {
-        "beige":   {"bg": (244, 239, 232), "panel": (255,255,255), "fg": (45, 45, 45), "muted": (92,92,92)},
-        "charcoal":{"bg": (20, 22, 24),   "panel": (35,37,39),     "fg": (238,238,238), "muted": (200,200,200)},
-        "mint":    {"bg": (235, 246, 242), "panel": (255,255,255), "fg": (34,49,46),    "muted": (78,98,93)},
-    }
-    theme = theme or random.choice(list(THEMES.keys()))
-    C = THEMES[theme]
-
-    img = Image.new("RGB", (W, H), C["bg"])
-    draw = ImageDraw.Draw(img)
-
-    # Khung tổng
-    PAD_X, PAD_TOP, PAD_BOTTOM = 80, 120, 180
-    box_radius = 36
-    box = (PAD_X, PAD_TOP, W-PAD_X, H-PAD_BOTTOM)
-    draw.rounded_rectangle(box, radius=box_radius, fill=C["panel"])
-
-    # Vùng nội dung
-    IN = 72
-    left, top = box[0]+IN, box[1]+IN
-    content_w = (box[2]-box[0]) - 2*IN
-
-    # Font
-    title_font = load_font(88)        # to, Playfair
-    sub_font   = load_font(40)        # body
-    ita_font   = load_font(40, italic=True)
-    wm_font    = load_font(34)
-
-    # ===== Title =====
-    title = f"Ngày {day_name} {vn_day_month()}"  # thêm ngày/tháng VN
-    t_lines, t_h, lh_t = wrap_text(draw, title, title_font, content_w, 1.12)
-    y = top
-    for line in t_lines:
-        draw.text((left, y), line, font=title_font, fill=C["fg"])
-        y += lh_t
-
-    y += 24
-
-    # ===== Hook (màu muted) =====
-    hook_lines, hook_h, lh_h = wrap_text(draw, hook_text, sub_font, content_w, 1.35)
-    for line in hook_lines:
-        draw.text((left, y), line, font=sub_font, fill=C["muted"])
-        y += lh_h
-
-    y += 36
-
-    # ===== Fun fact (prefix italic) =====
-    prefix = "Fun fact: "
-    pf_w = draw.textlength(prefix, font=ita_font)
-    ff_lines, ff_h, lh_ff = wrap_text(draw, fun_fact, sub_font, content_w - pf_w, 1.35)
-
-    draw.text((left, y), prefix, font=ita_font, fill=C["fg"])
-    draw.text((left+pf_w, y), ff_lines[0], font=sub_font, fill=C["fg"])
-    y += lh_ff
-    for line in ff_lines[1:]:
-        draw.text((left, y), line, font=sub_font, fill=C["fg"])
-        y += lh_ff
-
-    # ===== Footer =====
-    foot_y = box[3] - IN
-    draw.text((left, foot_y-80), "#viaDzDay", font=wm_font, fill=C["muted"])
-    draw.text((left, foot_y-40), "dz.day/today", font=wm_font, fill=C["muted"])
-
-    # QR
-    qr_size = 220
-    qr = qrcode.QRCode(box_size=8, border=1)
-    qr.add_data(short_url); qr.make(fit=True)
-    qr_img = qr.make_image(
-        fill_color=C["fg"],
-        back_color=C["panel"]
-    ).convert("RGB")
-    qr_img = qr_img.resize((qr_size, qr_size))
-    img.paste(qr_img, (box[2]-IN-qr_size, foot_y-qr_size+20))
-
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    buf.seek(0)
-    return buf
-
-# ---------- Caption ----------
-def build_caption(preset, day_name, fun_fact, nonce):
-    preset = (preset or "mia_nhe").strip()
-    if preset not in PRESETS: preset = "mia_nhe"
-    hook = PRESETS[preset][0]
-    link = shortlink_with_nonce(nonce)
-    return (
-        f"🎂 Hôm nay là Ngày {day_name} {vn_day_month()}\n"
-        f"{hook}\n"
-        f"Fun fact: {fun_fact}\n"
-        f"#viaDzDay {link}"
-    )
-
-# ---------- Telegram I/O ----------
-def send_msg(chat_id, text, parse_mode=None, reply_markup=None):
-    if not BOT_TOKEN: return
-    payload = {"chat_id": chat_id, "text": text}
-    if parse_mode: payload["parse_mode"] = parse_mode
-    if reply_markup: payload["reply_markup"] = json.dumps(reply_markup)
-    r = requests.post(f"{API_URL}/sendMessage", data=payload, timeout=10)
-    print("SEND >>>", r.text, flush=True)
-
-def send_photo(chat_id, png_bytes_io, caption=None, reply_markup=None):
-    data = {"chat_id": str(chat_id)}
-    if caption: data["caption"] = caption
-    if reply_markup: data["reply_markup"] = json.dumps(reply_markup)
-    files = {"photo": ("dzcard.png", png_bytes_io, "image/png")}
-    r = requests.post(f"{API_URL}/sendPhoto", data=data, files=files, timeout=20)
-    print("PHOTO >>>", r.text, flush=True)
-
-def kb_today(nonce):
-    return {
-      "inline_keyboard":[
-        [
-          {"text":"📤 Share Story", "callback_data": f"share:{nonce}"},
-          {"text":"📋 Copy Caption", "callback_data": f"copy:{nonce}"},
-          {"text":"💡 Suggest Day", "callback_data": "suggest"}
-        ]
-      ]
-    }
-
-# ---------- Today stub ----------
-def get_today():
-    # TODO: thay bằng source thực tế
-    return {
-        "day_name": "Bánh Crepe Toàn Cầu",
-        "hook": "Không ai bắt bạn tin, nhưng người ta bày ra để có cớ trộn bột rồi đổ mỏng cho sang.",
-        "fun_fact": "Crepe mỏng nhưng ăn nhiều vẫn mập."
-    }
-
-# ---------- Webhook ----------
-@app.route("/", methods=["GET"])
-def index():
-    return "DzDayBot alive"
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    update = request.get_json(force=True, silent=True) or {}
-    print("UPDATE >>>", update, flush=True)
-
-    # skip old updates
-    msg = update.get("message") or {}
-    msg_ts = msg.get("date")
-    if msg_ts and time.time() - msg_ts > MAX_UPDATE_AGE:
-        print("SKIP old", flush=True); 
-        return {"ok": True}
-
-    # messages
-    if "message" in update:
-        chat_id = (update["message"].get("chat") or {}).get("id")
-        text = (update["message"].get("text") or "").strip()
-        if text == "/start":
-            send_msg(chat_id,
-                "Xin chào, tôi là DzDay – giọng Dandattone, hơi mỉa nhưng chân thành 😉\n"
-                "Gõ /today để xem hôm nay nhân loại lại bịa ra ngày gì."
-            )
-            log_event(make_log(update,"start",text))
-        elif text == "/today":
-            if not check_daily_limit(chat_id):
-                send_msg(chat_id,"Hôm nay bạn share chăm quá. Muốn tiếp thì rủ thêm 2 bạn vào gõ /start nhé.")
-                log_event(make_log(update,"today",text, action="limit_reached"))
-                return {"ok": True}
-
-            d = get_today()
-            nonce = generate_nonce()
-            url  = shortlink_with_nonce(nonce)
-            theme = random.choice(["beige","charcoal","mint"])
-            card = render_card(d["day_name"], d["hook"], d["fun_fact"], url, theme=theme)
-            caption = (
-                f"🎂 *Hôm nay là Ngày {d['day_name']} {vn_day_month()}*\n"
-                f"{d['hook']}\n"
-                f"*Fun fact:* {d['fun_fact']}\n"
-                f"#viaDzDay {url}"
-            )
-            send_photo(chat_id, card, caption=caption, reply_markup=kb_today(nonce))
-            log_event(make_log(update,"today",text, nonce=nonce, caption_preset="mia_nhe"))
-        elif text.startswith("/suggest"):
-            idea = text.replace("/suggest","",1).strip()
-            if not idea:
-                send_msg(chat_id, "Gửi kiểu này nè: `/suggest Ngày thế giới ăn bún riêu`.", parse_mode="Markdown")
-                log_event(make_log(update,"suggest_prompt","suggest"))
-            else:
-                send_msg(chat_id, f"Đã ghi nhận gợi ý của bạn: “{idea}”. Tôi sẽ chê trước rồi mới duyệt.")
-                log_event(make_log(update,"suggest",idea, action="suggest"))
-        else:
-            send_msg(chat_id, "Tôi nghe không rõ lắm. Gõ /today hoặc /suggest cho tử tế.")
-            log_event(make_log(update,"unknown",text))
-
-    # callback buttons
-    if "callback_query" in update:
-        cq = update["callback_query"]; data = cq.get("data","")
-        chat_id = cq.get("from",{}).get("id")
-        d = get_today()
-        if data.startswith("share:"):
-            nonce = data.split(":",1)[1]
-            url = shortlink_with_nonce(nonce)
-            send_msg(chat_id, f"Bạn share card này nhé 👉 {url}\n#viaDzDay")
-            log_event(make_log(update,"today","share", nonce=nonce, action="share"))
-        elif data.startswith("copy:"):
-            nonce = data.split(":",1)[1]
-            cap = build_caption("mia_nhe", d["day_name"], d["fun_fact"], nonce)
-            send_msg(chat_id, cap)
-            log_event(make_log(update,"today","copy", nonce=nonce, action="copy", caption_preset="mia_nhe"))
-        elif data == "suggest":
-            send_msg(chat_id, "Gửi gợi ý bằng lệnh: /suggest Tên ngày")
-            log_event(make_log(update,"suggest_prompt","suggest"))
-
-    return {"ok": True}
-
-# ---------- keep warm ----------
+# -------------------------
+# Keep-warm
+# -------------------------
 def keep_warm():
     if not SELF_URL: return
     while True:

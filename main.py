@@ -1,4 +1,4 @@
-# main.py — DzDay (DzCard v2, Playfair Display, text wrapping)
+# main.py — DzDay (DzCard v2.1, Playfair Display, VN date, neutral tone)
 
 from flask import Flask, request
 import os, io, json, time, random, string, threading, datetime as dt
@@ -8,35 +8,55 @@ import qrcode
 
 app = Flask(__name__)
 
-# === ENV ===
+# ===== ENV =====
 BOT_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 API_URL     = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
 SELF_URL    = os.getenv("SELF_URL")        # https://<app>.up.railway.app/
 LOG_URL     = os.getenv("LOG_URL")         # Google Apps Script endpoint
 MAX_UPDATE_AGE = 90
 
-# === Paths (Playfair) ===
+# ===== Font paths (Playfair Display) =====
 FONT_REG_PATH = os.path.join("assets", "Playfair.ttf")
 FONT_ITA_PATH = os.path.join("assets", "Playfair-Italic.ttf")
 
-# === Runtime state ===
+def _assert_font(path, label):
+    if not os.path.exists(path):
+        print(f"[FONT ERR] {label} not found at {path}. Make sure Playfair files exist.", flush=True)
+
+_assert_font(FONT_REG_PATH, "Playfair Regular")
+_assert_font(FONT_ITA_PATH, "Playfair Italic")
+
+# ===== Runtime state =====
 DAILY_LIMIT = 10
 user_exports = {}   # {date_str: {chat_id: count}}
 
-# === Prompt presets (caption builder) ===
+# ===== Caption presets =====
 PRESETS = {
-    "mia_nhe":   ("Không ai bắt ông tin, nhưng người ta bày ra để có cớ làm chuyện nhỏ cho sang.",),
+    "mia_nhe":   ("Không ai bắt bạn tin, nhưng người ta bày ra để có cớ làm chuyện nhỏ cho sang.",),
     "tau_hai":   ("Cứ cho là nhân loại rảnh, nhưng cái rảnh này cũng đáng để cười nhẹ một cái.",),
     "trung_tinh":("Ghi chú hôm nay cho lịch sử cá nhân, khỏi lẫn vào mai.",)
 }
 
-# --- Utils ---
-def now_iso():
-    return dt.datetime.utcnow().isoformat() + "Z"
+# ---------- Time helpers (VN) ----------
+VN_OFFSET = dt.timedelta(hours=7)
+
+def now_utc():
+    return dt.datetime.utcnow()
+
+def now_vn():
+    return now_utc() + VN_OFFSET
 
 def today_key():
-    return dt.datetime.utcnow().strftime("%Y-%m-%d")
+    return now_vn().strftime("%Y-%m-%d")
 
+def vn_day_month():
+    n = now_vn()
+    return f"{n.day}/{n.month}"
+
+def now_iso():
+    return now_utc().isoformat() + "Z"
+
+# ---------- Misc ----------
 def generate_nonce(n=8):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
@@ -54,8 +74,8 @@ def check_daily_limit(chat_id):
     return True
 
 def log_event(payload):
-    if not LOG_URL: 
-        print("LOG >>> skipped", flush=True); 
+    if not LOG_URL:
+        print("LOG >>> skipped (no LOG_URL)", flush=True); 
         return
     try:
         r = requests.post(LOG_URL, json=payload, timeout=5)
@@ -64,11 +84,12 @@ def log_event(payload):
         print("LOG ERR >>>", e, flush=True)
 
 def make_log(update, command, text, nonce="", action="", caption_preset=""):
-    msg  = update.get("message") or update.get("callback_query", {}).get("message") or {}
-    user = (update.get("message", {}) or update.get("callback_query", {}).get("from") or {}).get("from") \
-           or update.get("message", {}).get("from") or {}
+    msg = update.get("message") or update.get("callback_query", {}).get("message") or {}
+    user_from_msg = (update.get("message") or {}).get("from") or {}
+    user_from_cq  = (update.get("callback_query") or {}).get("from") or {}
+    user = user_from_msg or user_from_cq
     username = user.get("username") or user.get("first_name") or "DzDayBot"
-    chat_id = (msg.get("chat") or {}).get("id") or update.get("callback_query", {}).get("from", {}).get("id")
+    chat_id = (msg.get("chat") or {}).get("id") or user_from_cq.get("id")
     return {
         "chat_id": chat_id,
         "username": username,
@@ -82,14 +103,18 @@ def make_log(update, command, text, nonce="", action="", caption_preset=""):
         "timestamp": now_iso()
     }
 
-# === Typography helpers (Pillow) ===
+# ---------- Typography (Pillow) ----------
 def load_font(size, italic=False):
     path = FONT_ITA_PATH if italic else FONT_REG_PATH
-    return ImageFont.truetype(path, size)
+    try:
+        return ImageFont.truetype(path, size)
+    except Exception as e:
+        print(f"[FONT LOAD ERR] {path}: {e}. Falling back to default.", flush=True)
+        return ImageFont.load_default()
 
 def wrap_text(draw, text, font, max_width, line_height_mult=1.2):
     """
-    Trả về (lines, total_height). Dùng textlength để đo, xuống dòng mềm.
+    Trả về (lines, total_height, line_height). Tự xuống dòng khi vượt max_width.
     """
     words = text.replace("\n", " \n ").split(" ")
     lines, current = [], ""
@@ -103,9 +128,8 @@ def wrap_text(draw, text, font, max_width, line_height_mult=1.2):
         else:
             if current:
                 lines.append(current)
-            # nếu từ quá dài, fallback cắt cứng:
+            # Nếu 1 từ quá dài, cắt mềm theo chiều rộng
             while draw.textlength(w, font=font) > max_width and len(w) > 1:
-                # tìm vị trí cắt
                 cut = len(w)
                 while cut > 1 and draw.textlength(w[:cut], font=font) > max_width:
                     cut -= 1
@@ -114,59 +138,56 @@ def wrap_text(draw, text, font, max_width, line_height_mult=1.2):
             current = w
     if current:
         lines.append(current)
-    # ước lượng chiều cao
     ascent, descent = font.getmetrics()
-    line_height = int(ascent + descent) * line_height_mult
+    line_height = int((ascent + descent) * line_height_mult)
     total_height = int(len(lines) * line_height)
-    return lines, total_height, int(line_height)
+    return lines, total_height, line_height
 
-# === Card render (DzCard v2) ===
+# ---------- Card render ----------
 def render_card(day_name, hook_text, fun_fact, short_url, theme=None):
     """
-    Trả về bytes PNG chuẩn 1080x1350 (IG portrait) với text bọc trong khung.
+    PNG 1080x1350, text bọc trong content box, Playfair Display.
     """
     W, H = 1080, 1350
-    # Themes
     THEMES = {
-        "beige":   {"bg": (244, 239, 232), "fg": (45, 45, 45), "muted": (92, 92, 92)},
-        "charcoal":{"bg": (20, 22, 24),   "fg": (238, 238, 238), "muted": (200, 200, 200)},
-        "mint":    {"bg": (235, 246, 242), "fg": (34, 49, 46),   "muted": (78, 98, 93)},
+        "beige":   {"bg": (244, 239, 232), "panel": (255,255,255), "fg": (45, 45, 45), "muted": (92,92,92)},
+        "charcoal":{"bg": (20, 22, 24),   "panel": (35,37,39),     "fg": (238,238,238), "muted": (200,200,200)},
+        "mint":    {"bg": (235, 246, 242), "panel": (255,255,255), "fg": (34,49,46),    "muted": (78,98,93)},
     }
     theme = theme or random.choice(list(THEMES.keys()))
     C = THEMES[theme]
 
-    # Canvas
     img = Image.new("RGB", (W, H), C["bg"])
     draw = ImageDraw.Draw(img)
 
-    # Safe area (padding)
+    # Khung tổng
     PAD_X, PAD_TOP, PAD_BOTTOM = 80, 120, 180
-    # Content box (rounded)
     box_radius = 36
     box = (PAD_X, PAD_TOP, W-PAD_X, H-PAD_BOTTOM)
-    draw.rounded_rectangle(box, radius=box_radius, fill=(255,255,255) if theme!="charcoal" else (35,37,39))
+    draw.rounded_rectangle(box, radius=box_radius, fill=C["panel"])
 
-    # Inner padding
+    # Vùng nội dung
     IN = 72
     left, top = box[0]+IN, box[1]+IN
     content_w = (box[2]-box[0]) - 2*IN
 
-    # Title
-    title_font = load_font(82)    # Playfair Regular
-    sub_font   = load_font(40)    # hook
+    # Font
+    title_font = load_font(88)        # to, Playfair
+    sub_font   = load_font(40)        # body
     ita_font   = load_font(40, italic=True)
+    wm_font    = load_font(34)
 
-    # Title lines (không dùng emoji trong ảnh)
-    title = f"Ngày {day_name}"
-    t_lines, t_h, lh_t = wrap_text(draw, title, title_font, content_w, 1.1)
+    # ===== Title =====
+    title = f"Ngày {day_name} {vn_day_month()}"  # thêm ngày/tháng VN
+    t_lines, t_h, lh_t = wrap_text(draw, title, title_font, content_w, 1.12)
     y = top
     for line in t_lines:
         draw.text((left, y), line, font=title_font, fill=C["fg"])
         y += lh_t
 
-    y += 24  # spacing
+    y += 24
 
-    # Hook (xám nhẹ)
+    # ===== Hook (màu muted) =====
     hook_lines, hook_h, lh_h = wrap_text(draw, hook_text, sub_font, content_w, 1.35)
     for line in hook_lines:
         draw.text((left, y), line, font=sub_font, fill=C["muted"])
@@ -174,12 +195,11 @@ def render_card(day_name, hook_text, fun_fact, short_url, theme=None):
 
     y += 36
 
-    # Fun fact: "Fun fact:" italic, còn lại regular
+    # ===== Fun fact (prefix italic) =====
     prefix = "Fun fact: "
     pf_w = draw.textlength(prefix, font=ita_font)
     ff_lines, ff_h, lh_ff = wrap_text(draw, fun_fact, sub_font, content_w - pf_w, 1.35)
 
-    # dòng đầu có prefix italic
     draw.text((left, y), prefix, font=ita_font, fill=C["fg"])
     draw.text((left+pf_w, y), ff_lines[0], font=sub_font, fill=C["fg"])
     y += lh_ff
@@ -187,42 +207,41 @@ def render_card(day_name, hook_text, fun_fact, short_url, theme=None):
         draw.text((left, y), line, font=sub_font, fill=C["fg"])
         y += lh_ff
 
-    # Footer (watermark + QR)
+    # ===== Footer =====
     foot_y = box[3] - IN
-    wm_font = load_font(34)
-    wm1 = "#viaDzDay"
-    wm2 = "dz.day/today"
-    draw.text((left, foot_y-80), wm1, font=wm_font, fill=C["muted"])
-    draw.text((left, foot_y-40), wm2, font=wm_font, fill=C["muted"])
+    draw.text((left, foot_y-80), "#viaDzDay", font=wm_font, fill=C["muted"])
+    draw.text((left, foot_y-40), "dz.day/today", font=wm_font, fill=C["muted"])
 
-    # QR at bottom-right inside content box
+    # QR
     qr_size = 220
     qr = qrcode.QRCode(box_size=8, border=1)
     qr.add_data(short_url); qr.make(fit=True)
-    qr_img = qr.make_image(fill_color=C["fg"], back_color=(255,255,255) if theme!="charcoal" else (35,37,39)).convert("RGB")
+    qr_img = qr.make_image(
+        fill_color=C["fg"],
+        back_color=C["panel"]
+    ).convert("RGB")
     qr_img = qr_img.resize((qr_size, qr_size))
     img.paste(qr_img, (box[2]-IN-qr_size, foot_y-qr_size+20))
 
-    # Export to bytes
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf
 
-# === Captions ===
+# ---------- Caption ----------
 def build_caption(preset, day_name, fun_fact, nonce):
     preset = (preset or "mia_nhe").strip()
     if preset not in PRESETS: preset = "mia_nhe"
     hook = PRESETS[preset][0]
     link = shortlink_with_nonce(nonce)
     return (
-        f"🎂 Hôm nay là Ngày {day_name}\n"
+        f"🎂 Hôm nay là Ngày {day_name} {vn_day_month()}\n"
         f"{hook}\n"
         f"Fun fact: {fun_fact}\n"
         f"#viaDzDay {link}"
     )
 
-# === Telegram helpers ===
+# ---------- Telegram I/O ----------
 def send_msg(chat_id, text, parse_mode=None, reply_markup=None):
     if not BOT_TOKEN: return
     payload = {"chat_id": chat_id, "text": text}
@@ -250,16 +269,16 @@ def kb_today(nonce):
       ]
     }
 
-# === Sample “today data” (stub) ===
+# ---------- Today stub ----------
 def get_today():
-    # Sau này thay bằng source thực tế (Checkiday / sheet). Giờ hardcode demo.
+    # TODO: thay bằng source thực tế
     return {
         "day_name": "Bánh Crepe Toàn Cầu",
-        "hook": "Không ai bắt ông tin, nhưng người ta bày ra để có cớ trộn bột rồi đổ mỏng cho sang.",
+        "hook": "Không ai bắt bạn tin, nhưng người ta bày ra để có cớ trộn bột rồi đổ mỏng cho sang.",
         "fun_fact": "Crepe mỏng nhưng ăn nhiều vẫn mập."
     }
 
-# === Webhook ===
+# ---------- Webhook ----------
 @app.route("/", methods=["GET"])
 def index():
     return "DzDayBot alive"
@@ -276,7 +295,7 @@ def webhook():
         print("SKIP old", flush=True); 
         return {"ok": True}
 
-    # Message
+    # messages
     if "message" in update:
         chat_id = (update["message"].get("chat") or {}).get("id")
         text = (update["message"].get("text") or "").strip()
@@ -288,7 +307,7 @@ def webhook():
             log_event(make_log(update,"start",text))
         elif text == "/today":
             if not check_daily_limit(chat_id):
-                send_msg(chat_id,"Hôm nay ông share chăm quá. Muốn tiếp thì rủ thêm 2 đứa vào gõ /start nhé.")
+                send_msg(chat_id,"Hôm nay bạn share chăm quá. Muốn tiếp thì rủ thêm 2 bạn vào gõ /start nhé.")
                 log_event(make_log(update,"today",text, action="limit_reached"))
                 return {"ok": True}
 
@@ -298,7 +317,7 @@ def webhook():
             theme = random.choice(["beige","charcoal","mint"])
             card = render_card(d["day_name"], d["hook"], d["fun_fact"], url, theme=theme)
             caption = (
-                f"🎂 *Hôm nay là Ngày {d['day_name']}*\n"
+                f"🎂 *Hôm nay là Ngày {d['day_name']} {vn_day_month()}*\n"
                 f"{d['hook']}\n"
                 f"*Fun fact:* {d['fun_fact']}\n"
                 f"#viaDzDay {url}"
@@ -311,22 +330,21 @@ def webhook():
                 send_msg(chat_id, "Gửi kiểu này nè: `/suggest Ngày thế giới ăn bún riêu`.", parse_mode="Markdown")
                 log_event(make_log(update,"suggest_prompt","suggest"))
             else:
-                send_msg(chat_id, f"Đã ghi nhận gợi ý của ông: “{idea}”. Tôi sẽ chê trước rồi mới duyệt.")
+                send_msg(chat_id, f"Đã ghi nhận gợi ý của bạn: “{idea}”. Tôi sẽ chê trước rồi mới duyệt.")
                 log_event(make_log(update,"suggest",idea, action="suggest"))
         else:
             send_msg(chat_id, "Tôi nghe không rõ lắm. Gõ /today hoặc /suggest cho tử tế.")
             log_event(make_log(update,"unknown",text))
 
-    # Callback buttons
+    # callback buttons
     if "callback_query" in update:
         cq = update["callback_query"]; data = cq.get("data","")
         chat_id = cq.get("from",{}).get("id")
-        # tái dựng today để build caption/share
         d = get_today()
         if data.startswith("share:"):
             nonce = data.split(":",1)[1]
             url = shortlink_with_nonce(nonce)
-            send_msg(chat_id, f"Ông share card này nhé 👉 {url}\n#viaDzDay")
+            send_msg(chat_id, f"Bạn share card này nhé 👉 {url}\n#viaDzDay")
             log_event(make_log(update,"today","share", nonce=nonce, action="share"))
         elif data.startswith("copy:"):
             nonce = data.split(":",1)[1]
@@ -336,9 +354,10 @@ def webhook():
         elif data == "suggest":
             send_msg(chat_id, "Gửi gợi ý bằng lệnh: /suggest Tên ngày")
             log_event(make_log(update,"suggest_prompt","suggest"))
+
     return {"ok": True}
 
-# === keep warm ===
+# ---------- keep warm ----------
 def keep_warm():
     if not SELF_URL: return
     while True:

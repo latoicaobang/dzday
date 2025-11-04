@@ -1,4 +1,4 @@
-# main.py — DzDay v3.1 (Square, Mobile-first, Telegram fixes)
+# main.py — DzDay v3.2 (fix: color must be int or tuple)
 from flask import Flask, request
 import os, io, time, threading, json, random, string, datetime as dt
 import requests
@@ -90,7 +90,7 @@ def build_caption(preset, day_name, fun_fact, nonce):
 # ---------- Card renderer (square) ----------
 def render_card_square(title, body, fun_fact, short_url):
     theme = pick_theme_by_today()
-    bg, card, fg, sub, chip = theme["bg"], theme["card"], theme["fg"], theme["sub"], theme["chip"]
+    bg, card, fg, sub, chip_color = theme["bg"], theme["card"], theme["fg"], theme["sub"], theme["chip"]
     W, H = CANVAS
 
     base = Image.new("RGB", CANVAS, bg)
@@ -142,18 +142,18 @@ def render_card_square(title, body, fun_fact, short_url):
 
     # footer chips
     chip_px, chip_py = 20, 10
-    def chip(text, x, y):
+    def draw_chip(text, x, y):
         w = int(d.textlength(text, font=small_font) + chip_px*2)
         h = int(sum(small_font.getmetrics())*1.15 + chip_py*2)
-        d.rounded_rectangle((x, y-h, x+w, y), radius=14, fill=chip)
+        d.rounded_rectangle((x, y-h, x+w, y), radius=14, fill=chip_color)
         d.text((x+chip_px, y-h+chip_py), text, font=small_font, fill=sub)
         return w, h
 
     cy_footer = ch - inner_pad
     left_x = cx
-    w1, _ = chip("#viaDzDay", left_x, cy_footer)
+    w1, _ = draw_chip("#viaDzDay", left_x, cy_footer)
     left_x += w1 + 12
-    chip("dz.day/today", left_x, cy_footer)
+    draw_chip("dz.day/today", left_x, cy_footer)
 
     # QR
     qr = qrcode.make(short_url).resize((300, 300))
@@ -231,7 +231,7 @@ def webhook():
 
         img_buf = render_card_square(title_text, body, fun, short_link)
         caption = build_caption("mia_nhe", "Ngày Bánh Crepe Toàn Cầu", fun, nonce)
-        send_photo(chat_id, img_buf, caption=caption)   # NOTE: no parse_mode -> tránh lỗi URL có _
+        send_photo(chat_id, img_buf, caption=caption)   # không set parse_mode để tránh lỗi _ trong URL
 
         send_inline_buttons(chat_id, nonce)
         log_event(make_log(update, "today", text, nonce=nonce, caption_preset="mia_nhe", action="render"))
@@ -260,8 +260,7 @@ def send_photo(chat_id, img_buf, caption=None):
     if not API_URL: return
     files = {"photo": ("dzcard.jpg", img_buf, "image/jpeg")}
     data = {"chat_id": chat_id}
-    # ❗ Không gán parse_mode để tránh lỗi Markdown với dấu _
-    if caption: data["caption"] = caption
+    if caption: data["caption"] = caption  # không gán parse_mode
     r = requests.post(f"{API_URL}/sendPhoto", data=data, files=files, timeout=30)
     print("PHOTO >>>", r.text, flush=True)
 
@@ -274,8 +273,7 @@ def send_inline_buttons(chat_id, nonce):
             {"text":"💡 Suggest Day","callback_data":"suggest"},
         ]]
     }
-    # dùng ZERO WIDTH WORD JOINER để text KHÔNG rỗng
-    payload = {"chat_id": chat_id, "text": "\u2063", "reply_markup": json.dumps(kb)}
+    payload = {"chat_id": chat_id, "text": "\u2063", "reply_markup": json.dumps(kb)}  # zero-width char
     r = requests.post(f"{API_URL}/sendMessage", json=payload, timeout=15)
     print("BTN >>>", r.text, flush=True)
 

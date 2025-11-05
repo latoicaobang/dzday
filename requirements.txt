@@ -1,5 +1,7 @@
-flask==3.0.3
-requests==2.32.3
+pyTelegramBotAPI==4.23.0
+Flask==3.0.3
 gunicorn==22.0.0
-Pillow==10.4.0
-qrcode==7.4.2
+# nếu có ghi log Google Sheets thì thêm:
+gspread==6.1.4
+google-auth==2.35.0
+google-auth-oauthlib==1.2.1
